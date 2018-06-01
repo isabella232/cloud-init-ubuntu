@@ -1,0 +1,229 @@
+commit 318666fa660e2ebbbbce723d1f7e8327d9f3be91
+Author: Mike Gerdts <mike.gerdts@joyent.com>
+Date:   Fri Jun 1 17:17:13 2018 +0000
+
+    write out ENI
+
+diff --git a/cloudinit/sources/DataSourceSmartOS.py b/cloudinit/sources/DataSourceSmartOS.py
+index d4de41a..3dfc0af 100644
+--- a/cloudinit/sources/DataSourceSmartOS.py
++++ b/cloudinit/sources/DataSourceSmartOS.py
+@@ -31,6 +31,7 @@ import re
+ import socket
+ 
+ from cloudinit import log as logging
++from cloudinit import netinfo
+ from cloudinit import serial
+ from cloudinit import sources
+ from cloudinit import util
+@@ -299,6 +300,8 @@ class DataSourceSmartOS(sources.DataSource):
+         self.network_data = md['network-data']
+         self.routes_data = md['routes']
+ 
++        configure_network(self.distro, self.network_config, False)
++
+         self._set_provisioned()
+         return True
+ 
+@@ -790,6 +793,23 @@ def convert_smartos_network_data(network_data=None,
+     Each route in sdc:routes is mapped to a route on each interface.
+     The sdc:routes properties 'dst' and 'gateway' map to 'network' and
+     'gateway'.  The 'linklocal' sdc:routes property is ignored.
++
++    Return value looks like:
++
++        {'config': [{'mac_address': u'32:68:3b:9a:fe:67',
++                     'name': u'net0',
++                     'subnets': [{'address': u'10.88.88.219/24',
++                                  'gateway': u'10.88.88.2',
++                                  'routes': [{u'gateway': u'10.88.88.3',
++                                              'network': u'3.0.0.0/8'},
++                                             {u'gateway': u'10.88.88.4',
++                                              'network': u'4.0.0.0/8'}],
++                                  'type': 'static'}],
++                     'type': 'physical'},
++                    {'address': [u'8.8.8.8', u'8.8.4.4'],
++                     'search': [],
++                     'type': 'nameserver'}],
++         'version': 1}
+     """
+ 
+     valid_keys = {
+@@ -912,6 +932,177 @@ def convert_smartos_network_data(network_data=None,
+     return {'version': 1, 'config': config}
+ 
+ 
++def mac_normalize(mac):
++    """MAC addresses cannot be compared with simple string comparisons
++       because hex digits may be upper or lower case and leading zeroes in
++       each octet may be elided.  This normalizes to lower case with leading
++       zeroes"""
++
++    try:
++        return ':'.join(['%02x' % int(o, 16) for o in mac.split(':')])
++    except ValueError:
++        return mac
++
++
++def map_nics(nwdata):
++    """The interface name specified in sdc:nics is unlikely to match the name
++       the system uses.  To be sure that the right config is set on each NIC, we
++       need to map them via MAC address.
++
++       Input nwdata is v1 network data.
++
++       Return is an dict mapping each VM nic to the v1 network data specific to
++       that NIC."""
++
++    if nwdata.get('version', None) != 1:
++        raise ValueError('Only version 1 network data supported, not %r' %
++                         nwdata.get('version', None))
++    try:
++        cfg = nwdata['config']
++    except KeyError:
++        raise ValueError('Network data contains no config')
++
++    # Read the live configuration to map MAC addresses to the interface name.
++    mac2net = dict()
++    for net, props in netinfo.netdev_info().items():
++        LOG.debug('net %r', net)
++        LOG.debug('props %r', props)
++        if net == 'lo':
++            continue
++        try:
++            mac = mac_normalize(props.get('hwaddr'))
++            mac2net[mac] = net
++            LOG.debug('VM nic %s has mac %s', net, mac)
++        except KeyError:
++            pass
++
++    net2cfg = dict()
++    for cfgitem in cfg:
++        # Skip nameservers, etc.
++        if cfgitem['type'] != 'physical':
++            continue
++
++        try:
++            mac = mac_normalize(cfgitem['mac_address'])
++        except KeyError:
++            LOG.warning('network device has no mac_address: %r', cfgitem)
++            continue
++
++        try:
++            net = mac2net[mac]
++        except KeyError:
++            LOG.warning('No netdev info with hwaddr %s', mac)
++            continue
++
++        LOG.debug('Mapping sdc:nic %s to VM nic %s via mac %s with config %r',
++                  cfgitem.get('name', 'unknown'), net, mac, cfgitem)
++        net2cfg[net] = cfgitem
++
++    return net2cfg
++
++
++def netmask_normalize(mask):
++    """Given a netmask as a CIDR mask or an IPv4 dotted quad, returns an IPv4
++       netmask in dotted quad format."""
++    try:
++        bits = int(mask)
++    except:
++        return mask
++    mask = (((1 << (32 - bits)) - 1) ^ 0xffffffff)
++    return '%d.%d.%d.%d' % (mask >> 24 & 0xff, mask >> 16 & 0xff,
++                            mask >> 8 & 0xff, mask & 0xff)
++
++
++def nwdata_to_eni(nwdata):
++    """Convert v1 nwdata to a string that may be placed in
++    /etc/network/interfaces to configure all nics specified by sdc:nics"""
++
++    ret = ['# Automatically generated by cloud-init DataSourceSmartOS']
++
++    # Get DNS configuration first so that it may be added to each interface.
++    dns = []
++    for cfg in nwdata['config']:
++        if cfg['type'] != 'nameserver':
++            continue
++        servers = cfg.get('address', None)
++        if servers:
++            dns.append('    dns-nameservers ' + ' '.join(servers))
++        search = cfg.get('search', None)
++        if search:
++            dns.append('    dns-search ' + ' '.join(search))
++
++    # Hard-code loopback interface
++    ret.extend(['auto lo',
++                'iface lo static',
++                '    address 127.0.0.1',
++                '    netmask 255.255.255.0'])
++
++    for nic, cfg in map_nics(nwdata).items():
++        ret.append('auto ' + nic)
++        for subnet in cfg.get('subnets', []):
++            stype = subnet.get('type', None)
++            if stype == 'static':
++                try:
++                    addr = subnet['address']
++                except:
++                    LOG.warning('NIC %s static subnet with no address: %r',
++                                nic, subnet)
++                    continue
++
++                ret.append('iface %s inet static' % nic)
++                try:
++                    (ip, mask) = addr.split('/')
++                    ret.append('    address ' + ip)
++                    ret.append('    netmask ' + netmask_normalize(mask))
++                except ValueError:
++                    ret.append('    address ' + addr)
++                for key in ['gateway', 'mtu']:
++                    if (subnet.has_key(key)):
++                        ret.append('    %s %s' % (key, subnet.get(key)))
++                ret.extend(dns)
++            elif stype == 'dhcp':
++                ret.append('iface %s inet dhcp' % nic)
++            else:
++                log.warning('unknown interface type %s for %s subnet %r',
++                            stype, nic, subnet)
++            for route in subnet.get('routes', []):
++                ret.append('    up route add -net %s gw %s dev %s || true' %
++                           (route.get('network'), route.get('gateway'), nic))
++                ret.append('    down route del -net %s gw %s dev %s || true' %
++                           (route.get('network'), route.get('gateway'), nic))
++    return '\n'.join(ret) + '\n'
++
++
++def configure_network(distro, nwcfg, force):
++    """Configure (or reconfigure if force=true) the network.  distro is a
++       subclass of cloudinit.distros, nwcfg is v1 network config, and force
++       specifies whether a previous configuration may be overridden."""
++
++    if distro is None:
++        LOG.debug('network not configured because distro is None')
++        return
++    try:
++        cfgfile = distro.network_conf_fn
++    except AttributeError:
++        LOG.debug('network not configured because %s does not define '
++                  'network_conf_fn', distro.__class__)
++        return
++    try:
++        os.stat(cfgfile)
++        if not force:
++            LOG.debug('network not reconfigured because %s exists', cfgfile)
++            return
++    except OSError as exc:
++        if exc.errno != errno.ENOENT:
++            raise
++
++    if cfgfile == '/etc/network/interfaces':
++        distro.apply_network(nwdata_to_eni(nwcfg))
++        return
++
++    LOG.debug('network not configured because no handler for %s', cfgfile)
++
++
+ # Used to match classes to dependencies
+ datasources = [
+     (DataSourceSmartOS, (sources.DEP_FILESYSTEM, )),

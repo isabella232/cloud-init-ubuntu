@@ -25,3 +25,4 @@ lp-1553158-bigstep.patch
 lp-1581200-gce-metadatafqdn.patch
 lp-1603222-fix-ephemeral-disk-fstab.patch
 resync-SmartOS-to-bbcc5e8.patch
+smartos-apply_network.patch
