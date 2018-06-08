@@ -1,11 +1,11 @@
-commit 318666fa660e2ebbbbce723d1f7e8327d9f3be91
+commit f5d88391581f16d95c4b9f6d7e333c16a09b2b23
 Author: Mike Gerdts <mike.gerdts@joyent.com>
 Date:   Fri Jun 1 17:17:13 2018 +0000
 
     write out ENI
 
 diff --git a/cloudinit/sources/DataSourceSmartOS.py b/cloudinit/sources/DataSourceSmartOS.py
-index d4de41a..3dfc0af 100644
+index d4de41a..265f56c 100644
 --- a/cloudinit/sources/DataSourceSmartOS.py
 +++ b/cloudinit/sources/DataSourceSmartOS.py
 @@ -31,6 +31,7 @@ import re
@@ -154,9 +154,9 @@ index d4de41a..3dfc0af 100644
 +
 +    # Hard-code loopback interface
 +    ret.extend(['auto lo',
-+                'iface lo static',
++                'iface lo inet static',
 +                '    address 127.0.0.1',
-+                '    netmask 255.255.255.0'])
++                '    netmask 255.0.0.0'])
 +
 +    for nic, cfg in map_nics(nwdata).items():
 +        ret.append('auto ' + nic)
